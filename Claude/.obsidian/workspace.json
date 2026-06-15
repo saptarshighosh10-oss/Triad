@@ -1,0 +1,239 @@
+{
+  "main": {
+    "id": "36580ebd01c50bd2",
+    "type": "split",
+    "children": [
+      {
+        "id": "e0fc3a250854ec7e",
+        "type": "tabs",
+        "dimension": 23.75296912114014,
+        "children": [
+          {
+            "id": "a47442746861c604",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Welcome.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Welcome"
+            }
+          },
+          {
+            "id": "7e84627052321f2d",
+            "type": "leaf",
+            "state": {
+              "type": "empty",
+              "state": {},
+              "icon": "lucide-file",
+              "title": "New tab"
+            }
+          }
+        ]
+      },
+      {
+        "id": "f34f7af57c640cbc",
+        "type": "tabs",
+        "dimension": 76.24703087885986,
+        "children": [
+          {
+            "id": "4574e76a09d756b9",
+            "type": "leaf",
+            "state": {
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "187bb0b63cf67007",
+    "type": "split",
+    "children": [
+      {
+        "id": "415d106aa030b63f",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0deec67256330c55",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "7f3f26946f0ab867",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "e28ac1c5842f3b85",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "42f3acdcf8a5627b",
+    "type": "split",
+    "children": [
+      {
+        "id": "026b9f48c7c19e9f",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f9dcde334163f501",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "171102d6c9ad58b2",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "d0743b081bd65e0b",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "ad208b3a1477d8da",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "1d0f23c8c12c95d2",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "4574e76a09d756b9",
+  "lastOpenFiles": [
+    "checkpoints/2026-06-12 HANDOFF — verify mode built.md",
+    "checkpoints/2026-06-12 open-questions-verify.md",
+    "design/open questions — verify mode.md",
+    "checkpoints/2026-06-12 sandbox-seatbelt-verified.md",
+    "checkpoints/2026-06-12 gate-green-sandbox-built.md",
+    "checkpoints/2026-06-12 stage-2-design-saved.md",
+    "design/stage 2 verify-select.md",
+    "design",
+    "topics/oracle independence.md",
+    "topics/layer 3 sidecar.md",
+    "topics/layer 2 free-claude-code.md",
+    "topics/layer 1 triad.md",
+    "topics/generate-verify-select.md",
+    "topics/free-cloud default.md",
+    "topics/execution sandbox.md",
+    "topics/cross-provider decorrelation.md",
+    "topics",
+    "index.md",
+    "agents/gemini.md",
+    "agents/claude.md",
+    "agents/chatgpt.md",
+    "agents",
+    "checkpoints/2026-06-12 stage-1-shipped.md",
+    "checkpoints",
+    "Welcome.md"
+  ]
+}

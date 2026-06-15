@@ -1,0 +1,5 @@
+# 2026-06-12 HANDOFF — verify mode built
+
+BUILT (one unit): Stage 2 verify mode = [[generate-verify-select]]. triad/oracle.py (CommandOracle + AbsentOracle + extract_code), triad/sandbox.py (seatbelt no-net verified), orchestrator.run_verify (generate -> verify -> select -> critique-revise, bounded 3 rounds, reuses live_parallel), CLI --oracle / --mode verify / /oracle. oracle-absent = visible UNVERIFIED selection-only (never self-grade, never fake pass); [[oracle independence]] enforced by construction; candidates run in the [[execution sandbox]]. TESTS: 105/105 offline (incl. real-sandbox pass/fail, critique-revise round-2 recovery, honest all-fail, no-oracle unverified). LIVE: end-to-end on real free models — Groq + OpenRouter both passed an add(a,b) oracle under the sandbox. Open items: [[open questions — verify mode]]. NEXT, DO FIRST: rotate Groq + OpenRouter keys (console.groq.com, openrouter.ai), update .env (or triad setup --all), then re-run the live verify: python -m triad --free --mode verify --oracle "...". See [[stage 2 verify-select]].
+
+Back to [[index]].
