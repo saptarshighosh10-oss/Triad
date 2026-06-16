@@ -37,7 +37,7 @@ class MockAgent(Agent):
         self.reply = reply
         self.calls = []  # [(messages, system), ...]
 
-    async def _provider_stream(self, messages, system):
+    async def _provider_stream(self, messages, system, max_tokens=None):
         self.calls.append(([dict(m) for m in messages], system))
         r = self.reply(self) if callable(self.reply) else self.reply
         # stream in small chunks to simulate real deltas
@@ -168,9 +168,10 @@ def test_relay():
     print("\n[orchestrator: relay]")
     agents = mk_three()
     orch = Orchestrator(agents, {}, quiet_console(), mode="relay")
+    orch.protocol = False  # test raw relay without protocol so assertions stay simple
     asyncio.run(orch.dispatch("design X"))
-    # agent 0 sees only the bare task; later agents see prior work
-    check("relay step1 gets bare task", agents[0].calls[0][0][0]["content"] == "design X")
+    # agent 0 sees the task (plus budget hint); later agents see prior work
+    check("relay step1 gets task", "design X" in agents[0].calls[0][0][0]["content"])
     p2 = agents[1].calls[0][0][0]["content"]
     check("relay step2 sees task", "design X" in p2)
     check("relay step2 sees prior work", "A-says" in p2 and "ChatGPT" in p2, p2[:80])

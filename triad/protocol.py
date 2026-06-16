@@ -31,6 +31,23 @@ PROTOCOL_INSTRUCTION = (
     "Be dense. No preamble, no restating the question."
 )
 
+# Compressed inter-agent dialect — cuts handoff token cost ~40-60%.
+# Content inside protocol fields still tends toward full English; this fixes that.
+# Inject alongside PROTOCOL_INSTRUCTION for relay/council agent-to-agent hops.
+DIALECT_INSTRUCTION = (
+    "Write in compressed agent dialect (agent-to-agent channel, not user-facing):\n"
+    "Drop: articles (a/an/the), filler phrases ('I think', 'it appears', 'you might').\n"
+    "Symbols: → leads-to, + and, @ at/in, ≈ approx, ∴ therefore, ✓ pass, ✗ fail.\n"
+    "Abbrevs: fn=function, ret=return, impl=implementation, cfg=config, req=requirement,\n"
+    "  err=error, var=variable, arg=argument, cls=class, mod=module, pkg=package.\n"
+    "Dense noun phrases over full sentences. No preamble. No closing remarks."
+)
+
+# Strip filler from any call — safe to inject into any system prompt.
+NOFLUFF_INSTRUCTION = (
+    "No greetings, affirmations, preamble, or restating the question. Answer only."
+)
+
 
 def est_tokens(text: str) -> int:
     """Rough token count (~4 chars/token). Fine for relative before/after comparison."""

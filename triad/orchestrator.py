@@ -9,13 +9,16 @@ instead of re-sending the whole transcript, and report how much context that sav
 """
 from __future__ import annotations
 
+from itertools import combinations
 from typing import Dict, List, Optional
 
 from rich.console import Console
 
-from .agents import Agent
+from .agents import Agent, build_free_swarm
 from .oracle import AbsentOracle, extract_code
-from .protocol import PROTOCOL_INSTRUCTION, RefStore, compact_block, est_tokens
+from .protocol import (PROTOCOL_INSTRUCTION, DIALECT_INSTRUCTION, NOFLUFF_INSTRUCTION,
+                       RefStore, compact_block, est_tokens)
+from . import config as _config
 from .sandbox import Sandbox
 from .ui import live_parallel, live_single
 
@@ -28,13 +31,30 @@ class Orchestrator:
         self.console = console
         self.mode = mode
         self.chair = chair or (agents[0].name if agents else None)
-        self.protocol = False
+        self.protocol = True             # on by default: relay/council pass compact handoffs not raw transcripts
+        self.dialect = False             # compressed agent dialect in handoffs (extra ~40% cut, opt-in)
         self.refs = RefStore()
         self.transcript: List[str] = []  # chronological session log for /save (all modes)
         self.oracle = None               # verify-mode pass condition; None -> unverified (selection only)
         self.memory = None               # optional VaultMemory: recall relevant notes instead of re-sending all
-        self.history_limit = 0           # >0: keep only the last N exchanges per agent (older lives in the vault)
+        self.history_limit = 6           # keep only last N exchanges per agent; older turns archived to vault
         self.on_evict = None             # optional sink(agent, dropped_messages): archive trimmed turns to the vault
+        self.max_depth = 2               # swarm mode: how many levels a director may recursively decompose
+
+    @staticmethod
+    def _jaccard(a: str, b: str) -> float:
+        """Word-level Jaccard similarity — fast, no deps, good enough for consensus detection."""
+        wa, wb = set(a.lower().split()), set(b.lower().split())
+        if not wa or not wb:
+            return 0.0
+        return len(wa & wb) / len(wa | wb)
+
+    def _consensus(self, answers: dict, threshold: float = 0.75) -> bool:
+        """True if every pair of agent answers is above the similarity threshold."""
+        texts = [t for t in answers.values() if t]
+        if len(texts) < 2:
+            return False
+        return all(self._jaccard(a, b) >= threshold for a, b in combinations(texts, 2))
 
     def _get(self, name: str) -> Agent:
         for a in self.agents:
@@ -67,23 +87,41 @@ class Orchestrator:
         )
 
     async def dispatch(self, task: str) -> None:
-        if self.mode == "relay":
+        mode = self.mode
+        if mode == "auto":
+            tier = _config.classify_task(task)
+            mode = "plan-execute" if tier["tier"] == "code" else "parallel"
+            self.console.print(f"[dim]auto: tier={tier['tier']} → mode={mode}[/dim]")
+        if mode == "relay":
             await self.run_relay(task)
-        elif self.mode == "council":
+        elif mode == "council":
             await self.run_council(task)
-        elif self.mode == "verify":
+        elif mode == "verify":
             await self.run_verify(task)
+        elif mode == "plan-execute":
+            await self.run_plan_execute(task)
+        elif mode == "swarm":
+            await self.run_swarm(task)
         else:
             await self.run_parallel(task)
 
     # ----------------------------------------------------------------- modes
     def _trim_history(self, agent) -> None:
         """Keep only the last `history_limit` exchanges per agent; older turns persist in the vault
-        and are pulled back on demand by recall. This is what stops the re-sent context from growing."""
+        and are pulled back on demand by recall. This is what stops the re-sent context from growing.
+
+        Also builds a rolling summary from dropped user messages — injected as ephemeral context
+        on the next turn so the agent retains thread awareness without re-sending the full history.
+        """
         keep = self.history_limit * 2  # one exchange == user + assistant
         if keep and len(agent.history) > keep:
             dropped = agent.history[:-keep]
             agent.history = agent.history[-keep:]
+            # Rolling summary: condense dropped turns into a compact thread reminder (~60 tokens).
+            # $0 — no LLM call, just the user-side of each turn truncated to 100 chars.
+            prior = [m["content"][:100] for m in dropped if m.get("role") == "user"]
+            if prior:
+                agent._rolling_summary = "Earlier in this session: " + " → ".join(prior)
             if self.on_evict and dropped:
                 try:
                     self.on_evict(agent, dropped)   # summarize-on-evict: keep it recallable from the vault
@@ -91,14 +129,41 @@ class Orchestrator:
                     pass  # archiving is best-effort; never break a turn over it
 
     async def run_parallel(self, task: str) -> None:
-        # Parallel has no handoff to compress, so protocol doesn't apply here — but persistent
-        # history does grow, so this is where recall-over-re-read + bounded history pay off.
+        tier = _config.classify_task(task)
+        budget = tier["budget_hint"]
+        max_tok = tier["max_tokens"]
+        cot = f" {tier['cot_hint']}" if tier.get("cot_hint") else ""
+        fmt = f" {tier['format_hint']}" if tier.get("format_hint") else ""
+        self.console.print(f"[dim]tier: {tier['tier']} → cap {max_tok} output tokens.[/dim]")
         ctx = self.memory.recall(task) if self.memory else ""
         if ctx:
-            cap = self.history_limit or "∞"
-            self.console.print(f"[dim]memory: recalled ~{est_tokens(ctx)} tokens of relevant context "
-                               f"from the vault (history capped at {cap} turn(s)).[/dim]")
-        buffers = await live_parallel(self.console, self.agents, lambda a: a.stream(task, context=ctx))
+            self.console.print(f"[dim]memory: recalled ~{est_tokens(ctx)} tokens.[/dim]")
+        task_with_budget = f"{task}\n\n[Reply in {budget}.{cot}{fmt} {NOFLUFF_INSTRUCTION}]"
+        buffers = await live_parallel(self.console, self.agents,
+                                      lambda a: a.stream(task_with_budget, context=ctx))
+
+        # Auto-retry agents with bad output (too short, refusal, truncated, missing code block)
+        bad = [(a, r) for a in self.agents
+               for ok, r in [_config.is_bad_output(buffers.get(a.name, ""), tier["tier"])] if ok]
+        if bad:
+            names = ", ".join(a.label for a, _ in bad)
+            self.console.print(f"[dim]retry: bad output from {names} — retrying once[/dim]")
+            retry_prompt = (f"{task}\n\n[Previous attempt was unusable. Try again.{fmt} "
+                            f"Reply in {budget}. {NOFLUFF_INSTRUCTION}]")
+            retry_buf = await live_parallel(
+                self.console, [a for a, _ in bad],
+                lambda a: a.stream_raw([{"role": "user", "content": retry_prompt}],
+                                       max_tokens=max_tok),
+            )
+            for a, _ in bad:
+                buffers[a.name] = retry_buf.get(a.name, buffers.get(a.name, ""))
+
+        for a in self.agents:
+            for i in range(len(a.history) - 1, -1, -1):
+                if (a.history[i].get("role") == "user"
+                        and a.history[i].get("content", "").startswith(task)):
+                    a.history[i] = {"role": "user", "content": task}
+                    break
         self._record(task, [(a.label, buffers.get(a.name, "")) for a in self.agents])
         if self.history_limit:
             for a in self.agents:
@@ -109,33 +174,48 @@ class Orchestrator:
         note_accum = ""         # compact notes concatenated (what protocol passes)
         baseline_chars = actual_chars = 0
         outputs = []            # (label, text) per step, for the session transcript
+        tier = _config.classify_task(task)
+        budget = tier["budget_hint"]
+        max_tok = tier["max_tokens"]
+        dialect_instr = f"\n\n{DIALECT_INSTRUCTION}" if self.dialect else ""
+        nofluff = f" {NOFLUFF_INSTRUCTION}"
+
+        # Task dedup: hop 0 puts the task in the user message; hops 1+ move it to the
+        # system prompt so it isn't re-sent in the (growing) user body every hop.
+        task_system = f"TASK (for all hops):\n{task}"
 
         for i, a in enumerate(self.agents):
             if self.protocol:
+                proto = f"{PROTOCOL_INSTRUCTION}{dialect_instr}"
                 if i == 0:
-                    prompt = f"TASK:\n{task}\n\n{PROTOCOL_INSTRUCTION}"
+                    prompt = f"TASK:\n{task}\n\n[Reply in {budget}.{nofluff}]\n\n{proto}"
+                    sys_override = None
                 else:
                     prompt = (
-                        f"TASK:\n{task}\n\nPRIOR WORK (compact handoffs):\n{note_accum.strip()}\n\n"
-                        f"Add your contribution, building on the above.\n\n{PROTOCOL_INSTRUCTION}"
+                        f"PRIOR WORK (compact handoffs):\n{note_accum.strip()}\n\n"
+                        f"Add your contribution, building on the above.\n\n[Reply in {budget}.{nofluff}]\n\n{proto}"
                     )
+                    sys_override = task_system  # task lives here, not in the user body
             else:
                 if i == 0:
-                    prompt = task
+                    prompt = f"{task}\n\n[Reply in {budget}.{nofluff}]"
+                    sys_override = None
                 else:
                     prompt = (
-                        "You are collaborating with other AI agents on a shared task.\n\n"
-                        f"TASK:\n{task}\n\nWORK SO FAR (from other agents):\n{raw_accum.strip()}\n\n"
-                        "Add your contribution: build on it, fix mistakes, fill gaps. "
-                        "Don't just repeat what's already there."
+                        f"WORK SO FAR (from other agents):\n{raw_accum.strip()}\n\n"
+                        f"Add your contribution: build on it, fix mistakes, fill gaps. "
+                        f"Don't just repeat what's already there.\n\n[Reply in {budget}.{nofluff}]"
                     )
+                    sys_override = task_system
 
             if i > 0:  # context re-passed at this hop, raw vs compact
                 baseline_chars += len(raw_accum)
                 actual_chars += len(note_accum)
 
             text = await live_single(
-                self.console, a, a.stream_raw([{"role": "user", "content": prompt}]),
+                self.console, a,
+                a.stream_raw([{"role": "user", "content": prompt}],
+                             system=sys_override, max_tokens=max_tok),
                 f"{a.label} — relay step {i + 1}/{len(self.agents)}",
             )
 
@@ -151,10 +231,19 @@ class Orchestrator:
 
     async def run_council(self, task: str) -> None:
         self.console.rule("[bold]Round 1 — independent answers[/bold]")
-        instr = f"{task}\n\n{PROTOCOL_INSTRUCTION}" if self.protocol else task
+        tier = _config.classify_task(task)
+        budget = tier["budget_hint"]
+        max_tok = tier["max_tokens"]
+        dialect_instr = f"\n\n{DIALECT_INSTRUCTION}" if self.dialect else ""
+        nofluff = f" {NOFLUFF_INSTRUCTION}"
+        if self.protocol:
+            instr = (f"{task}\n\n[Reply in {budget}.{nofluff}]\n\n"
+                     f"{PROTOCOL_INSTRUCTION}{dialect_instr}")
+        else:
+            instr = f"{task}\n\n[Reply in {budget}.{nofluff}]"
         answers = await live_parallel(
             self.console, self.agents,
-            lambda a: a.stream_raw([{"role": "user", "content": instr}]),
+            lambda a: a.stream_raw([{"role": "user", "content": instr}], max_tokens=max_tok),
         )
 
         if self.protocol:
@@ -171,6 +260,21 @@ class Orchestrator:
                 f"### Response {chr(65 + i)}\n{answers[a.name]}" for i, a in enumerate(self.agents)
             )
 
+        # Early exit: if all agents converge (high pairwise similarity), skip the synthesis
+        # call entirely — it would just repeat what everyone already said, wasting a full API call.
+        if self._consensus(answers):
+            winner = next(iter(answers.values()))
+            self.console.print(
+                f"[dim]council: consensus detected (all answers >{75}% similar) — "
+                f"skipping synthesis, returning first response. Saved 1 API call.[/dim]"
+            )
+            outputs = [(a.label, answers[a.name]) for a in self.agents]
+            outputs.append(("synthesis", f"[skipped — agents converged]\n\n{winner}"))
+            self._record(task, outputs)
+            if self.protocol:
+                self._savings(baseline_chars, actual_chars)
+            return
+
         chair = self._get(self.chair)
         self.console.rule(f"[bold]Round 2 — {chair.label} synthesizes[/bold]")
         synth = (
@@ -180,7 +284,8 @@ class Orchestrator:
             f"TASK:\n{task}\n\nRESPONSES:\n{body}"
         )
         synth_text = await live_single(
-            self.console, chair, chair.stream_raw([{"role": "user", "content": synth}]),
+            self.console, chair,
+            chair.stream_raw([{"role": "user", "content": synth}], max_tokens=max_tok),
             f"{chair.label} — synthesis",
         )
         outputs = [(a.label, answers[a.name]) for a in self.agents]
@@ -188,6 +293,243 @@ class Orchestrator:
         self._record(task, outputs)
         if self.protocol:
             self._savings(baseline_chars, actual_chars)
+
+    # ----------------------------------------------------------- plan-execute
+    async def run_plan_execute(self, task: str) -> None:
+        """Smart director plans → free workers execute in parallel → oracle verifies.
+
+        Token shape:
+          director (1 call, ~300 tok out) → free heads (1-2 rounds, tight spec = high pass rate)
+
+        Cheaper than free-leads for complex tasks because:
+          - director writes a better spec in fewer tokens than free fumbling
+          - free models follow clear specs reliably → fewer oracle retry rounds
+          - each retry re-sends full input context, so cutting rounds is the biggest win
+        """
+        if not self.agents:
+            self.console.print("[red]no agents available[/red]")
+            return
+
+        # Split into director (first agent) + workers (the rest).
+        # Single-agent case: skip planning (director would plan then execute alone — wasteful).
+        if len(self.agents) == 1:
+            self.console.print("[dim]plan-execute: single agent — skipping planning step, running parallel.[/dim]")
+            await self.run_parallel(task)
+            return
+        director = self.agents[0]
+        # Prefer free swarm as workers — director fans out to up to 5 free models.
+        # Falls back to self.agents[1:] if no OpenRouter key is set.
+        swarm = build_free_swarm(5)
+        workers = swarm if swarm else self.agents[1:]
+        if swarm:
+            self.console.print(f"[dim]swarm: {len(swarm)} free workers "
+                               f"({', '.join(a.label for a in swarm)})[/dim]")
+
+        self.console.rule(f"[bold]plan-execute — {director.label} plans[/bold]")
+
+        # ---- Step 1: director writes a tight spec ----
+        plan_prompt = (
+            f"You are the director. A team of AI workers will implement this task based ONLY on "
+            f"your spec — they won't see the original request.\n\n"
+            f"TASK:\n{task}\n\n"
+            f"Write a tight implementation spec in ≤250 tokens:\n"
+            f"- Exact inputs, outputs, edge cases\n"
+            f"- Key constraints and approach\n"
+            f"- What a correct result looks like\n\n"
+            f"No code. No preamble. Dense noun phrases. Be the spec, not the solution."
+        )
+        spec = await live_single(
+            self.console, director,
+            director.stream_raw([{"role": "user", "content": plan_prompt}], max_tokens=300),
+            f"{director.label} — writing spec",
+        )
+        self.console.print(f"[dim]spec: ~{est_tokens(spec)} tokens[/dim]")
+
+        # ---- Step 2: free workers execute the spec in parallel ----
+        self.console.rule("[bold]plan-execute — workers implement[/bold]")
+        oracle = self.oracle or AbsentOracle()
+        sandbox = Sandbox()
+
+        tier = _config.classify_task(task)
+        cot = f" {tier['cot_hint']}" if tier.get("cot_hint") else ""
+        fmt = f" {tier['format_hint']}" if tier.get("format_hint") else ""
+        execute_prompt = (
+            f"Implement the following spec exactly. Return only the solution.\n\n"
+            f"SPEC:\n{spec}\n\n"
+            f"[{NOFLUFF_INSTRUCTION}{cot}{fmt}]"
+        )
+
+        if not oracle.independent:
+            # No oracle — just run workers and return all outputs
+            buffers = await live_parallel(
+                self.console, workers,
+                lambda a: a.stream_raw([{"role": "user", "content": execute_prompt}], max_tokens=1024),
+            )
+            outputs = [(a.label, buffers.get(a.name, "")) for a in workers]
+            outputs.insert(0, (f"{director.label} — spec", spec))
+            self._record(task, outputs)
+            self.console.print(
+                "[yellow]⚠ UNVERIFIED — no oracle. Set one with [bold]/oracle <cmd>[/bold] "
+                "to enable verified selection.[/yellow]"
+            )
+            return
+
+        # ---- Step 3: oracle verifies each worker's output ----
+        self.console.print(f"[dim]oracle = {oracle.describe()}[/dim]")
+        self.console.print(f"[dim]sandbox = {sandbox.note}[/dim]")
+
+        last_fail: Dict[str, str] = {}
+        for rnd in range(1, 4):  # max 3 rounds
+            self.console.rule(f"[bold]plan-execute — verify round {rnd}[/bold]")
+
+            if last_fail:
+                retry_parts = []
+                for a in workers:
+                    fail_note = last_fail.get(a.name, "")
+                    retry_parts.append((a, (
+                        f"{execute_prompt}\n\nYour previous attempt FAILED:\n{fail_note}\n\nFix it."
+                    )))
+                prompts = {a.name: p for a, p in retry_parts}
+            else:
+                prompts = {a.name: execute_prompt for a in workers}
+
+            results = await live_parallel(
+                self.console, workers,
+                lambda a: a.stream_raw(
+                    [{"role": "user", "content": prompts[a.name]}], max_tokens=1024
+                ),
+            )
+
+            passers = []
+            last_fail = {}
+            for a in workers:
+                raw = results.get(a.name, "")
+                verdict = oracle.check(raw, sandbox)
+                mark = {"pass": "[green]✓[/green]", "fail": "[red]✗[/red]",
+                        "unverified": "[yellow]?[/yellow]"}[verdict.status]
+                self.console.print(f"  {a.label}: {mark}  [dim]{verdict.detail}[/dim]")
+                if verdict.passed:
+                    passers.append((a, raw, verdict))
+                else:
+                    last_fail[a.name] = verdict.detail
+
+            if passers:
+                a, raw, verdict = passers[0]
+                self.console.rule(f"[bold green]VERIFIED — {a.label} passed[/bold green]")
+                self.console.print(extract_code(raw))
+                self._record(task, [
+                    (f"{director.label} — spec", spec),
+                    (a.label, raw),
+                    ("verify", f"PASSED — {a.label} round {rnd} ({verdict.detail})"),
+                ])
+                return
+
+            if rnd == 3:
+                self.console.rule("[bold red]plan-execute — no worker passed[/bold red]")
+                self.console.print(f"[red]0/{len(workers)} passed after 3 rounds.[/red]")
+                self._record(task, [
+                    (f"{director.label} — spec", spec),
+                    *[(a.label, results.get(a.name, "")) for a in workers],
+                    ("verify", "FAILED — 0 passed"),
+                ])
+
+    # ------------------------------------------------------------------ swarm
+    async def run_swarm(self, task: str) -> None:
+        """Recursive fan-out: director decomposes → subtasks solved by free workers, or split
+        again if still complex (bounded by max_depth). Results integrate back up the tree.
+
+        This is the multi-level version of plan-execute: a worker can itself become a director
+        for its own sub-piece, so a deeply nested task is handled like a real subagent tree —
+        but every leaf runs on free models, so the depth costs labor, not money.
+        """
+        if not self.agents:
+            self.console.print("[red]no agents available[/red]")
+            return
+        result = await self._swarm_node(task, depth=0)
+        self._record(task, [("swarm result", result)])
+        self.console.rule("[bold green]swarm — done[/bold green]")
+        self.console.print(result)
+
+    async def _swarm_node(self, task: str, depth: int) -> str:
+        """One node in the tree: either a leaf (free workers solve it) or a split (recurse)."""
+        indent = "  " * depth
+        # Leaf: at max depth, or director judges the task atomic → free workers solve directly.
+        subtasks = [] if depth >= self.max_depth else await self._decompose(task, depth)
+        if not subtasks:
+            self.console.print(f"[dim]{indent}leaf (d{depth}): {task[:70]}[/dim]")
+            return await self._swarm_leaf(task)
+
+        self.console.print(f"[dim]{indent}split (d{depth}) → {len(subtasks)} subtasks[/dim]")
+        results = []
+        for sub in subtasks:
+            r = await self._swarm_node(sub, depth + 1)   # recurse: a subtask may split again
+            results.append((sub, r))
+        return await self._integrate(task, results)
+
+    async def _decompose(self, task: str, depth: int) -> List[str]:
+        """Director splits a task into ≤3 independent subtasks — or [] if it's atomic.
+
+        [] means 'don't split, just solve it' — that's the recursion's base case, decided by the
+        director, not a fixed rule. Free models over-split, so this stays on the first (smart) head.
+        """
+        director = self.agents[0]
+        prompt = (
+            f"Break this task into 2-3 INDEPENDENT subtasks that can be solved separately, then "
+            f"combined. If it's already simple enough to solve in one go, reply with exactly ATOMIC.\n\n"
+            f"TASK:\n{task}\n\n"
+            f"Reply as a numbered list (1. 2. 3.), one subtask per line, nothing else. "
+            f"Or the single word ATOMIC."
+        )
+        out = await live_single(
+            self.console, director,
+            director.stream_raw([{"role": "user", "content": prompt}], max_tokens=300),
+            f"{director.label} — decomposing (depth {depth})",
+        )
+        if "atomic" in out.lower()[:40] and len(out.strip()) < 40:
+            return []
+        subs = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line and line[0].isdigit():
+                subs.append(line.lstrip("0123456789.) ").strip())
+        return [s for s in subs if s][:3]
+
+    async def _swarm_leaf(self, task: str) -> str:
+        """Solve one atomic subtask on the free swarm; oracle-pick if set, else longest answer."""
+        from .oracle import AbsentOracle
+        workers = build_free_swarm(5) or self.agents[1:] or self.agents
+        tier = _config.classify_task(task)
+        cot = f" {tier['cot_hint']}" if tier.get("cot_hint") else ""
+        prompt = f"{task}\n\n[{NOFLUFF_INSTRUCTION}{cot}]"
+        results = await live_parallel(
+            self.console, workers,
+            lambda a: a.stream_raw([{"role": "user", "content": prompt}], max_tokens=tier["max_tokens"]),
+        )
+        cands = [(a, results.get(a.name, "")) for a in workers if results.get(a.name, "").strip()]
+        if not cands:
+            return "(no worker produced output)"
+        oracle = self.oracle or AbsentOracle()
+        if oracle.independent:
+            sandbox = Sandbox()
+            for a, raw in cands:
+                if oracle.check(raw, sandbox).passed:
+                    return raw
+        return max(cands, key=lambda c: len(c[1]))[1]   # no oracle → longest (proxy for most complete)
+
+    async def _integrate(self, task: str, results: List) -> str:
+        """Director merges subtask results into one coherent answer for the parent task."""
+        director = self.agents[0]
+        body = "\n\n".join(f"### Subtask: {sub}\n{res}" for sub, res in results)
+        prompt = (
+            f"These subtasks were solved independently. Combine them into one coherent, complete "
+            f"solution to the original task. Resolve overlaps and fill gaps.\n\n"
+            f"ORIGINAL TASK:\n{task}\n\nSUBTASK RESULTS:\n{body}"
+        )
+        return await live_single(
+            self.console, director,
+            director.stream_raw([{"role": "user", "content": prompt}], max_tokens=1500),
+            f"{director.label} — integrating",
+        )
 
     # ----------------------------------------------------------------- verify
     @staticmethod

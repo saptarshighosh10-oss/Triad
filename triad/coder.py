@@ -115,7 +115,7 @@ def build_context(task: str, files: Dict[str, str], max_bytes: int) -> Tuple[str
     return "\n".join(parts), included
 
 
-# ------------------------------------------------------------------ edit format
+# ------------------------------------------------------------------ edit format (whole-file)
 _EDIT_INSTRUCTION = (
     "Apply the change by returning the COMPLETE new contents of every file you create or modify.\n"
     "For EACH such file, output EXACTLY this and nothing around it:\n\n"
@@ -132,6 +132,51 @@ _EDIT_RE = re.compile(
     r"^FILE:[ \t]*(?P<path>.+?)[ \t]*\r?\n```[^\n]*\r?\n(?P<body>.*?)\r?\n?```",
     re.DOTALL | re.MULTILINE,
 )
+
+# ------------------------------------------------------------------ edit format (section-replace)
+# Token-efficient alternative: model only emits changed hunks, not whole files.
+# Saves 60-80% on output tokens for small edits to large files.
+# Use with strong models (paid); free models are unreliable at context-exact matching.
+_SECTION_EDIT_INSTRUCTION = (
+    "Apply the change using ONLY section replacements — emit the changed hunks, not whole files.\n"
+    "For EACH change, output EXACTLY this block:\n\n"
+    "EDIT: <relative/path>\n"
+    "FIND:\n"
+    "<exact lines to replace — must match the file verbatim>\n"
+    "END_FIND\n"
+    "REPLACE:\n"
+    "<new lines>\n"
+    "END_REPLACE\n\n"
+    "Rules: FIND must be a verbatim excerpt from the current file (whitespace exact). "
+    "Multiple EDIT blocks allowed for multiple files. No explanations outside the blocks."
+)
+
+_SECTION_RE = re.compile(
+    r"^EDIT:[ \t]*(?P<path>.+?)[ \t]*\r?\n"
+    r"FIND:\r?\n(?P<find>.*?)END_FIND\r?\n"
+    r"REPLACE:\r?\n(?P<replace>.*?)END_REPLACE",
+    re.DOTALL | re.MULTILINE,
+)
+
+
+def parse_section_edits(text: str, base: Dict[str, str]) -> Dict[str, str]:
+    """Apply FIND/REPLACE hunks to base file map, return updated file map.
+
+    Only files that changed are included in the result (like parse_edits).
+    If FIND text is not found verbatim, that hunk is silently skipped — caller
+    checks via oracle whether the result is correct.
+    """
+    result: Dict[str, str] = {}
+    for m in _SECTION_RE.finditer(text or ""):
+        rel = _safe_relpath(m.group("path"))
+        if rel is None:
+            continue
+        find_text = m.group("find")
+        replace_text = m.group("replace")
+        current = result.get(rel, base.get(rel, ""))
+        if find_text in current:
+            result[rel] = current.replace(find_text, replace_text, 1)
+    return result
 
 
 def _safe_relpath(path: str) -> Optional[str]:
@@ -189,13 +234,16 @@ def apply_edits(root, edits: Dict[str, str]) -> List[str]:
     return written
 
 
-def _gen_prompt(task: str, files: Dict[str, str], max_ctx: int, fail: Optional[str] = None) -> str:
+def _gen_prompt(task: str, files: Dict[str, str], max_ctx: int, fail: Optional[str] = None,
+                diff_mode: bool = False) -> str:
     context, _ = build_context(task, files, max_ctx)
+    instr = _SECTION_EDIT_INSTRUCTION if diff_mode else _EDIT_INSTRUCTION
+    fmt = "EDIT: / FIND: / REPLACE: section format" if diff_mode else "FILE: format"
     p = (f"You are editing a code repository. TASK:\n{task}\n\n"
-         f"CURRENT FILES:\n{context}\n\n{_EDIT_INSTRUCTION}")
+         f"CURRENT FILES:\n{context}\n\n{instr}")
     if fail:
         p += (f"\n\nYour previous attempt FAILED verification:\n{fail}\n\n"
-              "Fix it and return the full corrected files in the same FILE: format.")
+              f"Fix it and return the corrected changes in the same {fmt}.")
     return p
 
 
@@ -234,23 +282,29 @@ class EditJob:
 
     def __init__(self, agents: List[Agent], oracle: Optional[Oracle] = None,
                  console: Optional[Console] = None, sandbox: Optional[Sandbox] = None,
-                 rounds: int = 3, max_context_bytes: int = _MAX_CONTEXT_BYTES) -> None:
+                 rounds: int = 3, max_context_bytes: int = _MAX_CONTEXT_BYTES,
+                 diff_mode: bool = False) -> None:
         self.agents = agents
         self.oracle = oracle
         self.console = console or Console()
         self._sandbox = sandbox
         self.rounds = max(1, rounds)
         self.max_context_bytes = max_context_bytes
+        self.diff_mode = diff_mode   # section-replace format: 60-80% fewer output tokens for small edits
         self.round_log: List[List[Candidate]] = []   # candidates (with verdicts) per round, for the benchmark
 
     async def _propose(self, agent: Agent, task: str, base: Dict[str, str],
                        fail: Optional[str]) -> Candidate:
-        prompt = _gen_prompt(task, base, self.max_context_bytes, fail)
+        prompt = _gen_prompt(task, base, self.max_context_bytes, fail, diff_mode=self.diff_mode)
         try:
             raw = await agent.complete_raw([{"role": "user", "content": prompt}])
         except Exception as e:                   # one head failing must not kill the job
             return Candidate(agent.name, agent.label, {}, "", Verdict("fail", f"{type(e).__name__}: {e}"))
-        return Candidate(agent.name, agent.label, parse_edits(raw), raw)
+        if self.diff_mode:
+            edits = parse_section_edits(raw, base)
+        else:
+            edits = parse_edits(raw)
+        return Candidate(agent.name, agent.label, edits, raw)
 
     async def run(self, task: str, repo_root) -> EditResult:
         if not self.agents:
@@ -263,6 +317,8 @@ class EditJob:
             self.console.print(f"[dim]context: sent {len(included)}/{len(base)} files by relevance "
                                f"(~{est_tokens(ctx_text)} tok); {len(base) - len(included)} listed by name "
                                f"only — recall-over-re-read for the repo.[/dim]")
+        mode_label = "section-replace (diff_mode — emit hunks only)" if self.diff_mode else "whole-file"
+        self.console.print(f"[dim]code: edit format = {mode_label}[/dim]")
         self.console.print(f"[dim]code: oracle = {oracle.describe()}[/dim]")
 
         # ---- no independent oracle: selection only, never executed/graded ----

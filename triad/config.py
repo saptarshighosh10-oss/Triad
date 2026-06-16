@@ -66,6 +66,86 @@ def resolve(name: str) -> dict:
     }
 
 
-def max_tokens() -> int:
-    """Max output tokens per turn (Anthropic requires it; others honor it). Read lazily."""
-    return int(os.environ.get("TRIAD_MAX_TOKENS", "4096"))
+_CODE_SIGNALS = frozenset({
+    "code", "implement", "write", "fix", "edit", "refactor", "function", "class",
+    "bug", "test", "script", "debug", "build", "create", "def ", "```",
+})
+_MEDIUM_SIGNALS = frozenset({
+    "explain", "why", "describe", "compare", "difference", "how does", "how do",
+    "walk me through", "break down", "pros and cons", "trade", "vs ", "versus",
+})
+_SIMPLE_PREFIXES = ("what ", "who ", "when ", "where ", "is ", "does ", "can ", "list ", "name ")
+
+
+# Free OpenRouter models ranked by capability — used as swarm workers in plan-execute.
+# All use the :free suffix; catalog drifts so verify slugs if one stops working.
+FREE_OR_MODELS = [
+    "deepseek/deepseek-r1:free",
+    "deepseek/deepseek-chat-v3-5:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "qwen/qwen2.5-72b-instruct:free",
+    "microsoft/phi-4-reasoning:free",
+    "qwen/qwen2.5-coder-32b-instruct:free",
+    "google/gemma-2-27b-it:free",
+    "mistralai/mistral-7b-instruct:free",
+    "meta-llama/llama-3.1-8b-instruct:free",
+    "google/gemma-2-9b-it:free",
+]
+
+
+def is_bad_output(text: str, tier: str) -> tuple:
+    """Detect outputs worth retrying: too short, refusal, no code block, truncated."""
+    t = text.strip()
+    if len(t) < 40:
+        return True, "too short"
+    low = t.lower()
+    if any(low.startswith(r) for r in ("i cannot", "i'm unable", "i am unable", "as an ai")):
+        return True, "refusal"
+    if tier == "code" and "```" not in t:
+        return True, "no code block"
+    if t and t[-1].isalpha() and "```" not in t[-30:]:
+        return True, "truncated"
+    return False, ""
+
+
+def classify_task(task: str) -> dict:
+    """Classify a task into a tier — $0, no API call, pure regex.
+
+    Returns tier, max_tokens, budget_hint, cot_hint, format_hint.
+    cot_hint and format_hint are injected into free-model prompts to improve output quality.
+    """
+    t = task.lower().strip()
+    if any(sig in t for sig in _CODE_SIGNALS):
+        return {
+            "tier": "code", "max_tokens": 2048, "budget_hint": "≤2000 tokens",
+            "cot_hint": "Think step by step before writing code.",
+            "format_hint": "Output ONLY a fenced code block. Nothing outside it.",
+        }
+    if any(sig in t for sig in _MEDIUM_SIGNALS):
+        return {
+            "tier": "medium", "max_tokens": 512, "budget_hint": "≤400 tokens",
+            "cot_hint": "Reason briefly before answering.",
+            "format_hint": "",
+        }
+    if len(task) < 100 or any(t.startswith(p) for p in _SIMPLE_PREFIXES):
+        return {
+            "tier": "simple", "max_tokens": 256, "budget_hint": "≤150 tokens",
+            "cot_hint": "", "format_hint": "",
+        }
+    return {
+        "tier": "medium", "max_tokens": 512, "budget_hint": "≤400 tokens",
+        "cot_hint": "Reason briefly before answering.",
+        "format_hint": "",
+    }
+
+
+def max_tokens(tier: str = "medium") -> int:
+    """Max output tokens per turn. Tier-aware: simple=256, medium=512, code=2048.
+
+    TRIAD_MAX_TOKENS env override still applies (hard ceiling for all tiers).
+    Was a flat 4096 for every call — this alone cuts cost 30-87% depending on task mix.
+    """
+    defaults = {"simple": 256, "medium": 512, "code": 2048}
+    base = defaults.get(tier, 512)
+    env = os.environ.get("TRIAD_MAX_TOKENS")
+    return int(env) if env else base

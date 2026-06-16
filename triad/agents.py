@@ -33,6 +33,7 @@ class Agent:
         self.base_url: Optional[str] = cfg.get("base_url")
         self.system_prompt: str = ""
         self.history: List[Message] = []
+        self._rolling_summary: str = ""  # injected as ephemeral context; rebuilt on trim
         self._client = None
 
     # --------------------------------------------------------------- meta
@@ -64,12 +65,21 @@ class Agent:
         """
         self.history.append({"role": "user", "content": user_msg})
         system = self.system_prompt
+        if getattr(self, '_rolling_summary', ''):
+            system = f"{self._rolling_summary}\n\n{system}".strip() if system else self._rolling_summary
         if context:
             system = f"{context}\n\n{system}".strip() if system else context
         full = ""
-        async for delta in self._provider_stream(self.history, system):
-            full += delta
-            yield delta
+        try:
+            async for delta in self._provider_stream(self.history, system):
+                full += delta
+                yield delta
+        except Exception:
+            # Stream failed — remove the orphan user message so the next call
+            # doesn't send two consecutive user messages (API error on most providers).
+            if self.history and self.history[-1].get("content") == user_msg:
+                self.history.pop()
+            raise
         self.history.append({"role": "assistant", "content": full})
 
     async def complete(self, user_msg: str) -> str:
@@ -80,20 +90,23 @@ class Agent:
 
     # ------------------------------------------------ ephemeral (orchestration)
     async def stream_raw(
-        self, messages: List[Message], system: Optional[str] = None
+        self, messages: List[Message], system: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
         sys_prompt = system if system is not None else self.system_prompt
-        async for delta in self._provider_stream(messages, sys_prompt):
+        async for delta in self._provider_stream(messages, sys_prompt, max_tokens=max_tokens):
             yield delta
 
-    async def complete_raw(self, messages: List[Message], system: Optional[str] = None) -> str:
+    async def complete_raw(self, messages: List[Message], system: Optional[str] = None,
+                           max_tokens: Optional[int] = None) -> str:
         out = ""
-        async for d in self.stream_raw(messages, system):
+        async for d in self.stream_raw(messages, system, max_tokens=max_tokens):
             out += d
         return out
 
     # --------------------------------------------------------- provider hook
-    async def _provider_stream(self, messages: List[Message], system: str) -> AsyncIterator[str]:
+    async def _provider_stream(self, messages: List[Message], system: str,
+                               max_tokens: Optional[int] = None) -> AsyncIterator[str]:
         raise NotImplementedError
         yield  # pragma: no cover  (makes this an async generator)
 
@@ -116,14 +129,15 @@ class OpenAICompatibleAgent(Agent):
             self._client = AsyncOpenAI(**kwargs)
         return self._client
 
-    async def _provider_stream(self, messages, system):
+    async def _provider_stream(self, messages, system, max_tokens=None):
         client = self._obj()
         msgs: List[Message] = []
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.extend(messages)
         stream = await client.chat.completions.create(
-            model=self.model, messages=msgs, stream=True, max_tokens=config.max_tokens()
+            model=self.model, messages=msgs, stream=True,
+            max_tokens=max_tokens or config.max_tokens(),
         )
         async for chunk in stream:
             if chunk.choices:
@@ -170,11 +184,16 @@ class ClaudeAgent(Agent):
             self._client = AsyncAnthropic(**kwargs)
         return self._client
 
-    async def _provider_stream(self, messages, system):
+    async def _provider_stream(self, messages, system, max_tokens=None):
         client = self._obj()
-        kwargs = dict(model=self.model, max_tokens=config.max_tokens(), messages=messages)
+        kwargs = dict(model=self.model, max_tokens=max_tokens or config.max_tokens(),
+                      messages=messages)
         if system:
-            kwargs["system"] = system
+            # cache_control marks the system prompt for Anthropic's prompt cache:
+            # after the first call, re-sends cost ~10% of normal. Saves 90% on
+            # system-prompt tokens for long sessions with a stable system prompt.
+            kwargs["system"] = [{"type": "text", "text": system,
+                                  "cache_control": {"type": "ephemeral"}}]
         async with client.messages.stream(**kwargs) as stream:
             async for text in stream.text_stream:
                 yield text
@@ -201,13 +220,13 @@ class GeminiAgent(Agent):
             contents.append({"role": role, "parts": [{"text": m["content"]}]})
         return contents
 
-    async def _provider_stream(self, messages, system):
+    async def _provider_stream(self, messages, system, max_tokens=None):
         client = self._obj()
         from google.genai import types
 
         cfg = types.GenerateContentConfig(
             system_instruction=system or None,
-            max_output_tokens=config.max_tokens(),
+            max_output_tokens=max_tokens or config.max_tokens(),
         )
         maybe = client.aio.models.generate_content_stream(
             model=self.model, contents=self._to_contents(messages), config=cfg
@@ -226,24 +245,33 @@ PAID_AGENTS = (OpenAIAgent, ClaudeAgent, GeminiAgent)
 FREE_AGENTS = (GroqAgent, OpenRouterAgent, NIMAgent)
 ROSTERS = {"paid": PAID_AGENTS, "free": FREE_AGENTS, "all": PAID_AGENTS + FREE_AGENTS}
 
-# Quality order for the free roster (best first). The selector tries the best model that
-# isn't currently rate-limited, falls to the next, and re-promotes the better one once its
-# cooldown passes. Coding-weighted: GPT-OSS-120B > Qwen-coder (NIM) > Llama-70B (Groq).
-# Override per machine with TRIAD_FREE_RANK="openrouter,nim,groq".
 FREE_RANK = ("openrouter", "nim", "groq")
 
 
 def build_agents(roster: str = "paid") -> List[Agent]:
-    """Return the agents in `roster` whose key (or local base_url) is present, in order.
-
-    roster: 'paid' (OpenAI/Anthropic/Gemini), 'free' (Groq/OpenRouter/NIM, distinct
-    lineages), or 'all'. The free roster is *substrate*, not a validated capability:
-    three free chat opinions make correlated errors and then agree, so they need an
-    executable verifier (the generate-verify-select work) before any answer is trusted.
-    """
+    """Return the agents in `roster` whose key (or local base_url) is present, in order."""
     agents: List[Agent] = []
     for cls in ROSTERS.get(roster, PAID_AGENTS):
         a = cls()
         if a.available:
             agents.append(a)
+    return agents
+
+
+def build_free_swarm(n: int) -> List[Agent]:
+    """Spin up n OpenRouter agents using different free models from the ranked catalog.
+
+    Used by plan-execute so a paid director can fan work out to many free workers.
+    Falls back gracefully if OPENROUTER_API_KEY is missing — returns empty list.
+    """
+    from . import config as _cfg
+    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if not key:
+        return []
+    agents: List[Agent] = []
+    for model_id in _cfg.FREE_OR_MODELS[:n]:
+        a = OpenRouterAgent()
+        a.model = model_id
+        a.label = model_id.split("/")[-1].replace(":free", "")
+        agents.append(a)
     return agents

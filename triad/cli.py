@@ -28,7 +28,7 @@ from .skills import Skill, load_skills
 DEFAULT_ENV = Path(__file__).resolve().parent.parent / ".env"
 
 HELP = """[bold]Commands[/bold]
-  /mode parallel|relay|council|verify   switch how agents collaborate
+  /mode parallel|relay|council|verify|plan-execute   switch how agents collaborate
   /code <task>                   three-head verify-select EDIT of files in cwd (uses /oracle)
   /oracle <cmd> | off            pass condition for verify + /code (e.g. /oracle "pytest -q")
   /protocol on|off               compact handoffs in relay/council (saves tokens)
@@ -46,11 +46,15 @@ HELP = """[bold]Commands[/bold]
   /quit                          exit
 
 [bold]Modes[/bold]
-  parallel  same task to all three at once, independent answers side by side
-  relay     agents work in sequence, each building on the previous output
-  council   all answer, then a chair agent synthesizes the best single answer
-  verify    generate candidates, run each against an oracle in the sandbox, keep a passer
+  auto          (default) classify task → plan-execute for code, parallel for everything else
+  parallel      same task to all three at once, independent answers side by side
+  relay         agents work in sequence, each building on the previous output
+  council       all answer, then a chair agent synthesizes the best single answer
+  verify        generate candidates, run each against an oracle in the sandbox, keep a passer
+  plan-execute  smart director plans (1 call) → free workers implement → oracle verifies
             (critique-revise if none); no oracle -> "unverified, selection only" (set with /oracle)
+  swarm         recursive fan-out: director splits the task into subtasks, each solved by free
+            workers or split again (bounded by max_depth), then integrated — a subagent tree
 """
 
 
@@ -100,11 +104,12 @@ def _command(line: str, orch: Orchestrator, agents, skills, console) -> bool:
     if c == "/help":
         console.print(HELP)
     elif c == "/mode":
-        if len(parts) > 1 and parts[1] in ("parallel", "relay", "council", "verify"):
+        valid = ("parallel", "relay", "council", "verify", "plan-execute", "swarm", "auto")
+        if len(parts) > 1 and parts[1] in valid:
             orch.mode = parts[1]
             console.print(f"mode -> [bold]{orch.mode}[/bold]")
         else:
-            console.print("usage: /mode parallel|relay|council|verify")
+            console.print("usage: /mode parallel|relay|council|verify|plan-execute|swarm|auto")
     elif c == "/oracle":
         if len(parts) > 1 and parts[1].lower() in ("off", "none", "clear"):
             orch.oracle = None
@@ -179,7 +184,7 @@ async def repl(args) -> None:
     skills = load_skills(args.skills_dir)
     orch = Orchestrator(agents, skills, console, mode=args.mode, chair=args.chair)
     mem_on = bool(getattr(args, "memory", False))
-    orch.history_limit = args.history_limit if args.history_limit else (6 if mem_on else 0)
+    orch.history_limit = args.history_limit if args.history_limit else (6 if mem_on else orch.history_limit)
     if mem_on and not args.vault:
         console.print("[yellow]--memory needs --vault (that's where memory lives) — memory off.[/yellow]")
         mem_on = False
@@ -761,7 +766,8 @@ def main() -> None:
 
     p = argparse.ArgumentParser(prog="triad",
                                 description="Talk to ChatGPT, Claude, and Gemini at once.")
-    p.add_argument("--mode", default="parallel", choices=["parallel", "relay", "council", "verify"])
+    p.add_argument("--mode", default="auto",
+                   choices=["auto", "parallel", "relay", "council", "verify", "plan-execute", "swarm"])
     p.add_argument("--oracle", default=None, metavar="CMD",
                    help='verify-mode pass condition, run against each candidate in the sandbox, '
                         'e.g. --oracle "pytest -q"')
