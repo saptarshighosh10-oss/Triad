@@ -259,19 +259,31 @@ def build_agents(roster: str = "paid") -> List[Agent]:
 
 
 def build_free_swarm(n: int) -> List[Agent]:
-    """Spin up n OpenRouter agents using different free models from the ranked catalog.
+    """Spin up n free workers SPREAD ACROSS PROVIDERS, so the swarm doesn't rate-limit itself.
 
-    Used by plan-execute so a paid director can fan work out to many free workers.
-    Falls back gracefully if OPENROUTER_API_KEY is missing — returns empty list.
+    Stacking every worker on one provider (the old behavior) trips that provider's free-tier
+    limit the moment the tree fans out. Instead we seed one agent per available provider (Groq /
+    NIM / OpenRouter — distinct lineages, distinct rate buckets), then top up any remaining slots
+    with extra distinct OpenRouter free models. Returns [] only if no free provider is configured.
     """
     from . import config as _cfg
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        return []
     agents: List[Agent] = []
-    for model_id in _cfg.FREE_OR_MODELS[:n]:
-        a = OpenRouterAgent()
-        a.model = model_id
-        a.label = model_id.split("/")[-1].replace(":free", "")
-        agents.append(a)
-    return agents
+    # One per provider, using its config default (verified-live) model — spreads load + decorrelates.
+    for cls in (GroqAgent, NIMAgent, OpenRouterAgent):
+        a = cls()
+        if a.available:
+            a.label = f"{a.label}:{a.model.split('/')[-1].replace(':free','')[:16]}"
+            agents.append(a)
+    # Top up remaining slots with extra distinct OpenRouter free models, if a key is present.
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        used = {a.model for a in agents}
+        for model_id in _cfg.FREE_OR_MODELS:
+            if len(agents) >= n:
+                break
+            if model_id in used:
+                continue
+            a = OpenRouterAgent()
+            a.model = model_id
+            a.label = model_id.split("/")[-1].replace(":free", "")
+            agents.append(a)
+    return agents[:n]

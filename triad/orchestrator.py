@@ -90,8 +90,17 @@ class Orchestrator:
         mode = self.mode
         if mode == "auto":
             tier = _config.classify_task(task)
-            mode = "plan-execute" if tier["tier"] == "code" else "parallel"
-            self.console.print(f"[dim]auto: tier={tier['tier']} → mode={mode}[/dim]")
+            if tier["tier"] != "code":
+                mode = "parallel"                      # not code → just answer in parallel
+            elif _config.is_multipart(task):
+                mode = "swarm"                         # several independent pieces → split them
+            elif self.oracle:
+                mode = "verify"                        # one coupled artifact + a test → retry loop
+            else:
+                mode = "plan-execute"                  # code, no test → director + free workers
+            self.console.print(f"[dim]auto: tier={tier['tier']}"
+                               f"{' · multipart' if _config.is_multipart(task) else ''}"
+                               f"{' · oracle' if self.oracle else ''} → mode={mode}[/dim]")
         if mode == "relay":
             await self.run_relay(task)
         elif mode == "council":
@@ -446,9 +455,20 @@ class Orchestrator:
             self.console.print("[red]no agents available[/red]")
             return
         result = await self._swarm_node(task, depth=0)
-        self._record(task, [("swarm result", result)])
-        self.console.rule("[bold green]swarm — done[/bold green]")
+        # If an oracle is set, verify the INTEGRATED result — the tree's pieces only count if
+        # they actually fit together and pass. Per-leaf checks can't catch interface mismatch.
+        verdict_line = ""
+        if self.oracle and self.oracle.independent:
+            v = self.oracle.check(result, Sandbox())
+            verdict_line = f"\n\n[oracle] {'PASS' if v.passed else 'FAIL'} — {v.detail}"
+            rule = "[bold green]swarm — VERIFIED[/bold green]" if v.passed else "[bold red]swarm — FAILED[/bold red]"
+        else:
+            rule = "[bold green]swarm — done[/bold green]"
+        self._record(task, [("swarm result", result + verdict_line)])
+        self.console.rule(rule)
         self.console.print(result)
+        if verdict_line:
+            self.console.print(verdict_line)
 
     async def _swarm_node(self, task: str, depth: int) -> str:
         """One node in the tree: either a leaf (free workers solve it) or a split (recurse)."""
@@ -464,6 +484,12 @@ class Orchestrator:
         for sub in subtasks:
             r = await self._swarm_node(sub, depth + 1)   # recurse: a subtask may split again
             results.append((sub, r))
+        # Guard: if every subtask came back empty (all workers throttled/errored), don't ask the
+        # director to "integrate" from nothing — it will hallucinate. Fail loudly instead.
+        if not any(r.strip() for _, r in results):
+            self.console.print(f"[red]{indent}all {len(subtasks)} subtasks failed "
+                               f"(workers errored/throttled) — nothing to integrate[/red]")
+            return ""
         return await self._integrate(task, results)
 
     async def _decompose(self, task: str, depth: int) -> List[str]:
@@ -495,9 +521,14 @@ class Orchestrator:
         return [s for s in subs if s][:3]
 
     async def _swarm_leaf(self, task: str) -> str:
-        """Solve one atomic subtask on the free swarm; oracle-pick if set, else longest answer."""
+        """Solve one atomic subtask on the free swarm; oracle-pick if set, else longest answer.
+
+        Workers are spread across providers (build_free_swarm) so a fanned-out tree doesn't
+        rate-limit itself. Error/throttle responses are filtered out — live_parallel records a
+        failed stream as '[error] ...' text, which must never be mistaken for a real answer.
+        """
         from .oracle import AbsentOracle
-        workers = build_free_swarm(5) or self.agents[1:] or self.agents
+        workers = build_free_swarm(3) or self.agents[1:] or self.agents
         tier = _config.classify_task(task)
         cot = f" {tier['cot_hint']}" if tier.get("cot_hint") else ""
         prompt = f"{task}\n\n[{NOFLUFF_INSTRUCTION}{cot}]"
@@ -505,9 +536,13 @@ class Orchestrator:
             self.console, workers,
             lambda a: a.stream_raw([{"role": "user", "content": prompt}], max_tokens=tier["max_tokens"]),
         )
-        cands = [(a, results.get(a.name, "")) for a in workers if results.get(a.name, "").strip()]
+        cands = []
+        for a in workers:
+            text = results.get(a.name, "").strip()
+            if text and "[error]" not in text:   # drop throttle/error responses, not real output
+                cands.append((a, text))
         if not cands:
-            return "(no worker produced output)"
+            return ""   # signal total failure — the caller must NOT integrate from nothing
         oracle = self.oracle or AbsentOracle()
         if oracle.independent:
             sandbox = Sandbox()
@@ -527,7 +562,7 @@ class Orchestrator:
         )
         return await live_single(
             self.console, director,
-            director.stream_raw([{"role": "user", "content": prompt}], max_tokens=1500),
+            director.stream_raw([{"role": "user", "content": prompt}], max_tokens=4096),
             f"{director.label} — integrating",
         )
 

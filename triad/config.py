@@ -108,6 +108,26 @@ def is_bad_output(text: str, tier: str) -> tuple:
     return False, ""
 
 
+_COUNT_WORDS = ("three ", "four ", "five ", "several ", "multiple ", "separate")
+_WEAK_SIGNALS = (" and also ", " as well as ", " then ", " plus ")
+
+
+def is_multipart(task: str) -> bool:
+    """True if the task looks like several INDEPENDENT pieces (good for swarm/decompose).
+
+    Cheap heuristic, $0. Independent multi-part work is where splitting wins; one tightly-coupled
+    artifact is where the retry loop wins instead. A count-word ('three', 'separate') only counts
+    when there's also a list separator, so 'return the three largest' doesn't false-trigger.
+    """
+    t = task.lower()
+    has_list = ", " in t or " and " in t
+    if any(w in t for w in _COUNT_WORDS) and has_list:
+        return True
+    if any(f"{n}." in t for n in (1, 2, 3)) and "2." in t:   # an actual numbered list (1. 2. …)
+        return True
+    return sum(s in t for s in _WEAK_SIGNALS) >= 2
+
+
 def classify_task(task: str) -> dict:
     """Classify a task into a tier — $0, no API call, pure regex.
 
